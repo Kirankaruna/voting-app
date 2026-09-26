@@ -1,11 +1,12 @@
-version: '3.9'
-
 services:
   backend:
     build: ./backend
     container_name: vote-backend
-    ports:
-      - "8001:8001"
+    expose:
+      - "8001"
+    environment:
+      - DB_PATH=/data/votes.db
+      - CORS_ORIGINS=http://localhost:3000
     volumes:
       - vote-data:/data
     restart: unless-stopped

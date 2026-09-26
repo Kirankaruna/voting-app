@@ -1,11 +1,23 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import VotePage from './VotePage'
 
+const STORAGE_KEY = 'teamvote_username'
+
 export default function App() {
-  const [username, setUsername] = useState('')
-  const [submitted, setSubmitted] = useState(false)
+  const [username, setUsername] = useState(() => localStorage.getItem(STORAGE_KEY) || '')
   const [input, setInput] = useState('')
   const [error, setError] = useState('')
+
+  // If username already in storage, go straight to vote page
+  const isJoined = Boolean(username)
+
+  useEffect(() => {
+    if (username) {
+      localStorage.setItem(STORAGE_KEY, username)
+    } else {
+      localStorage.removeItem(STORAGE_KEY)
+    }
+  }, [username])
 
   function handleJoin(e) {
     e.preventDefault()
@@ -18,12 +30,22 @@ export default function App() {
       setError('Username must be 32 characters or fewer.')
       return
     }
+    // Reject obvious injection attempts
+    if (/<|>|&|"|'/.test(name)) {
+      setError('Username contains invalid characters.')
+      return
+    }
     setUsername(name)
-    setSubmitted(true)
   }
 
-  if (submitted) {
-    return <VotePage username={username} />
+  function handleLeave() {
+    setUsername('')
+    setInput('')
+    setError('')
+  }
+
+  if (isJoined) {
+    return <VotePage username={username} onLeave={handleLeave} />
   }
 
   return (
@@ -46,6 +68,7 @@ export default function App() {
               onChange={(e) => { setInput(e.target.value); setError('') }}
               placeholder="e.g. Alex, Sam, Jordan..."
               className="w-full border border-gray-300 rounded-lg px-4 py-3 text-gray-800 focus:outline-none focus:ring-2 focus:ring-indigo-400"
+              maxLength={32}
               autoFocus
             />
             {error && <p className="text-red-500 text-sm mt-1">{error}</p>}

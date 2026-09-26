@@ -1,5 +1,7 @@
 import sqlite3
 import json
+import os
+import time
 from contextlib import asynccontextmanager
 from typing import List
 
@@ -7,8 +9,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+START_TIME = time.time()
+
 # ---------------------------------------------------------------------------
-# Hardcoded Poll Configuration
+# Poll Configuration
 # ---------------------------------------------------------------------------
 POLL = {
     "id": "friday-poll",
@@ -21,7 +25,8 @@ POLL = {
     ],
 }
 
-DB_PATH = "/data/votes.db"
+DB_PATH = os.getenv("DB_PATH", "/data/votes.db")
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -34,7 +39,8 @@ def get_db():
 
 
 def init_db():
-    with get_db() as conn:
+    conn = get_db()
+    try:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS votes (
@@ -44,12 +50,19 @@ def init_db():
             """
         )
         conn.commit()
+    finally:
+        conn.close()
 
 
 def get_vote_counts() -> dict:
     counts = {opt["id"]: 0 for opt in POLL["options"]}
-    with get_db() as conn:
-        rows = conn.execute("SELECT option_id, COUNT(*) as cnt FROM votes GROUP BY option_id").fetchall()
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT option_id, COUNT(*) as cnt FROM votes GROUP BY option_id"
+        ).fetchall()
+    finally:
+        conn.close()
     for row in rows:
         if row["option_id"] in counts:
             counts[row["option_id"]] = row["cnt"]
@@ -57,33 +70,50 @@ def get_vote_counts() -> dict:
 
 
 def get_user_vote(username: str):
-    with get_db() as conn:
-        row = conn.execute("SELECT option_id FROM votes WHERE username = ?", (username,)).fetchone()
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT option_id FROM votes WHERE username = ?", (username,)
+        ).fetchone()
+    finally:
+        conn.close()
     return row["option_id"] if row else None
 
 
 def record_vote(username: str, option_id: str):
-    with get_db() as conn:
+    conn = get_db()
+    try:
         conn.execute(
-            "INSERT OR REPLACE INTO votes (username, option_id) VALUES (?, ?)",
+            "INSERT INTO votes (username, option_id) VALUES (?, ?)",
             (username, option_id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
 
 # ---------------------------------------------------------------------------
 # WebSocket connection manager
 # ---------------------------------------------------------------------------
+
+MAX_CONNECTIONS = 100
+
 
 class ConnectionManager:
     def __init__(self):
         self.active: List[WebSocket] = []
 
     async def connect(self, ws: WebSocket):
+        if len(self.active) >= MAX_CONNECTIONS:
+            await ws.close(code=1008, reason="Server at capacity")
+            return False
         await ws.accept()
         self.active.append(ws)
+        return True
 
     def disconnect(self, ws: WebSocket):
-        self.active.remove(ws)
+        if ws in self.active:
+            self.active.remove(ws)
 
     async def broadcast(self, data: dict):
         message = json.dumps(data)
@@ -109,15 +139,38 @@ app = FastAPI(title="Voting Service", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 # ---------------------------------------------------------------------------
 # REST Endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/health")
+def health_check():
+    try:
+        conn = get_db()
+        conn.execute("SELECT 1")
+        conn.close()
+        db_status = "ok"
+    except Exception as e:
+        db_status = f"error: {e}"
+
+    uptime_seconds = round(time.time() - START_TIME, 1)
+    total_votes = sum(get_vote_counts().values())
+
+    return {
+        "status": "ok" if db_status == "ok" else "degraded",
+        "service": "vote-service",
+        "uptime_seconds": uptime_seconds,
+        "database": db_status,
+        "total_votes": total_votes,
+        "active_connections": len(manager.active),
+    }
+
 
 @app.get("/poll")
 def get_poll(username: str = ""):
@@ -149,7 +202,10 @@ async def submit_vote(body: VoteRequest):
 
     existing = get_user_vote(username)
     if existing:
-        raise HTTPException(status_code=409, detail="User has already voted")
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "User has already voted", "option_id": existing},
+        )
 
     record_vote(username, body.option_id)
     counts = get_vote_counts()
@@ -167,7 +223,9 @@ async def submit_vote(body: VoteRequest):
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    await manager.connect(ws)
+    accepted = await manager.connect(ws)
+    if not accepted:
+        return
     # Send current state immediately on connect
     counts = get_vote_counts()
     total = sum(counts.values())

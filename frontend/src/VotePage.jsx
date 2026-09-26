@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import Results from './Results'
 
 const COLORS = {
@@ -15,7 +15,9 @@ const BORDER_COLORS = {
   d: 'border-rose-400',
 }
 
-export default function VotePage({ username }) {
+const WS_RECONNECT_DELAY_MS = 3000
+
+export default function VotePage({ username, onLeave }) {
   const [poll, setPoll] = useState(null)
   const [counts, setCounts] = useState({})
   const [total, setTotal] = useState(0)
@@ -23,17 +25,25 @@ export default function VotePage({ username }) {
   const [loading, setLoading] = useState(true)
   const [voting, setVoting] = useState(false)
   const [error, setError] = useState('')
+  const [wsConnected, setWsConnected] = useState(false)
+
   const wsRef = useRef(null)
+  const reconnectTimerRef = useRef(null)
+  const pollLoadedRef = useRef(false)
 
   // Fetch initial poll state
   useEffect(() => {
     fetch(`/poll?username=${encodeURIComponent(username)}`)
-      .then((r) => r.json())
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        return r.json()
+      })
       .then((data) => {
         setPoll(data.poll)
         setCounts(data.counts)
         setTotal(data.total)
         setUserVote(data.user_vote)
+        pollLoadedRef.current = true
         setLoading(false)
       })
       .catch(() => {
@@ -42,24 +52,48 @@ export default function VotePage({ username }) {
       })
   }, [username])
 
-  // WebSocket for live updates
-  useEffect(() => {
+  // WebSocket with auto-reconnect — only starts after poll is loaded
+  const connectWs = useCallback(() => {
+    if (!pollLoadedRef.current) return
+
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
     const ws = new WebSocket(`${proto}://${window.location.host}/ws`)
     wsRef.current = ws
 
+    ws.onopen = () => setWsConnected(true)
+
     ws.onmessage = (event) => {
-      const data = JSON.parse(event.data)
-      if (data.type === 'vote_update') {
-        setCounts(data.counts)
-        setTotal(data.total)
+      try {
+        const data = JSON.parse(event.data)
+        if (data.type === 'vote_update') {
+          setCounts(data.counts)
+          setTotal(data.total)
+        }
+      } catch {
+        // ignore malformed messages
       }
     }
 
-    ws.onerror = () => console.warn('WebSocket error — live updates unavailable')
+    ws.onclose = () => {
+      setWsConnected(false)
+      reconnectTimerRef.current = setTimeout(connectWs, WS_RECONNECT_DELAY_MS)
+    }
 
-    return () => ws.close()
+    ws.onerror = () => {
+      ws.close()
+    }
   }, [])
+
+  // Start WS only after poll is fetched
+  useEffect(() => {
+    if (!loading && poll) {
+      connectWs()
+    }
+    return () => {
+      clearTimeout(reconnectTimerRef.current)
+      wsRef.current?.close()
+    }
+  }, [loading, poll, connectWs])
 
   async function handleVote(optionId) {
     if (userVote || voting) return
@@ -72,9 +106,11 @@ export default function VotePage({ username }) {
         body: JSON.stringify({ username, option_id: optionId }),
       })
       if (res.status === 409) {
-        setError('You have already voted.')
         const data = await res.json()
-        setUserVote(optionId)
+        // Use the server's recorded option_id, not the locally clicked one
+        const serverOptionId = data.detail?.option_id ?? optionId
+        setUserVote(serverOptionId)
+        setError('You have already voted.')
         return
       }
       if (!res.ok) {
@@ -119,9 +155,18 @@ export default function VotePage({ username }) {
               <p className="text-sm text-gray-500">Voting as</p>
               <p className="font-bold text-indigo-600 text-lg">{username}</p>
             </div>
-            <div className="text-right">
-              <p className="text-sm text-gray-500">Total votes</p>
-              <p className="font-bold text-gray-700 text-2xl">{total}</p>
+            <div className="flex items-center gap-4">
+              <div className="text-right">
+                <p className="text-sm text-gray-500">Total votes</p>
+                <p className="font-bold text-gray-700 text-2xl">{total}</p>
+              </div>
+              <button
+                onClick={onLeave}
+                className="text-sm text-gray-400 hover:text-gray-600 transition-colors"
+                title="Switch user"
+              >
+                Leave
+              </button>
             </div>
           </div>
         </div>
@@ -171,8 +216,16 @@ export default function VotePage({ username }) {
           {error && <p className="text-red-500 text-sm mt-3">{error}</p>}
         </div>
 
-        {/* Live Results */}
-        <Results poll={poll} counts={counts} total={total} userVote={userVote} />
+        {/* Live Results — only shown after user has voted */}
+        {userVote && (
+          <Results
+            poll={poll}
+            counts={counts}
+            total={total}
+            userVote={userVote}
+            wsConnected={wsConnected}
+          />
+        )}
       </div>
     </div>
   )
