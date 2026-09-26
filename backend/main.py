@@ -1,9 +1,12 @@
-import sqlite3
 import json
 import os
 import time
 from contextlib import asynccontextmanager
 from typing import List
+from urllib.parse import urlparse
+
+import psycopg2
+import psycopg2.extras
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +28,7 @@ POLL = {
     ],
 }
 
-DB_PATH = os.getenv("DB_PATH", "/data/votes.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 # ---------------------------------------------------------------------------
@@ -33,22 +36,23 @@ CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 # ---------------------------------------------------------------------------
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL environment variable is not set")
+    return psycopg2.connect(DATABASE_URL)
 
 
 def init_db():
     conn = get_db()
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS votes (
-                username TEXT PRIMARY KEY,
-                option_id TEXT NOT NULL
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS votes (
+                    username TEXT PRIMARY KEY,
+                    option_id TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
         conn.commit()
     finally:
         conn.close()
@@ -58,23 +62,27 @@ def get_vote_counts() -> dict:
     counts = {opt["id"]: 0 for opt in POLL["options"]}
     conn = get_db()
     try:
-        rows = conn.execute(
-            "SELECT option_id, COUNT(*) as cnt FROM votes GROUP BY option_id"
-        ).fetchall()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT option_id, COUNT(*) AS cnt FROM votes GROUP BY option_id"
+            )
+            rows = cur.fetchall()
     finally:
         conn.close()
     for row in rows:
         if row["option_id"] in counts:
-            counts[row["option_id"]] = row["cnt"]
+            counts[row["option_id"]] = int(row["cnt"])
     return counts
 
 
 def get_user_vote(username: str):
     conn = get_db()
     try:
-        row = conn.execute(
-            "SELECT option_id FROM votes WHERE username = ?", (username,)
-        ).fetchone()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT option_id FROM votes WHERE username = %s", (username,)
+            )
+            row = cur.fetchone()
     finally:
         conn.close()
     return row["option_id"] if row else None
@@ -83,10 +91,11 @@ def get_user_vote(username: str):
 def record_vote(username: str, option_id: str):
     conn = get_db()
     try:
-        conn.execute(
-            "INSERT INTO votes (username, option_id) VALUES (?, ?)",
-            (username, option_id),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO votes (username, option_id) VALUES (%s, %s)",
+                (username, option_id),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -153,20 +162,27 @@ app.add_middleware(
 def health_check():
     try:
         conn = get_db()
-        conn.execute("SELECT 1")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
         conn.close()
         db_status = "ok"
     except Exception as e:
         db_status = f"error: {e}"
 
+    db_host = urlparse(DATABASE_URL).hostname if DATABASE_URL else "not configured"
     uptime_seconds = round(time.time() - START_TIME, 1)
-    total_votes = sum(get_vote_counts().values())
+
+    try:
+        total_votes = sum(get_vote_counts().values())
+    except Exception:
+        total_votes = None
 
     return {
         "status": "ok" if db_status == "ok" else "degraded",
         "service": "vote-service",
         "uptime_seconds": uptime_seconds,
         "database": db_status,
+        "db_host": db_host,
         "total_votes": total_votes,
         "active_connections": len(manager.active),
     }
@@ -226,12 +242,11 @@ async def websocket_endpoint(ws: WebSocket):
     accepted = await manager.connect(ws)
     if not accepted:
         return
-    # Send current state immediately on connect
     counts = get_vote_counts()
     total = sum(counts.values())
     await ws.send_text(json.dumps({"type": "vote_update", "counts": counts, "total": total}))
     try:
         while True:
-            await ws.receive_text()  # keep connection alive
+            await ws.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(ws)

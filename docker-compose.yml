@@ -5,10 +5,8 @@ services:
     expose:
       - "8001"
     environment:
-      - DB_PATH=/data/votes.db
-      - CORS_ORIGINS=http://localhost:3000
-    volumes:
-      - vote-data:/data
+      - DATABASE_URL=${DATABASE_URL}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
     restart: unless-stopped
 
   frontend:
@@ -19,6 +17,3 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
-
-volumes:
-  vote-data:
